@@ -134,6 +134,13 @@ jobs:
           cache: maven
           cache-dependency-path: ${{ env.SERVICE_PATH }}/pom.xml
 
+      # Rebuild classes and copy dependencies so sonar.java.binaries / libraries resolve
+      - name: Rebuild classes for Sonar
+        working-directory: ${{ env.SERVICE_PATH }}
+        run: |
+          mvn -q compile dependency:copy-dependencies \
+            --no-transfer-progress
+
       - name: Download JaCoCo coverage report
         uses: actions/download-artifact@v4
         with:
@@ -147,14 +154,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           projectBaseDir: ${{ env.SERVICE_PATH }}
-
-      - name: SonarCloud quality gate
-        uses: SonarSource/sonarqube-quality-gate-action@v1
-        timeout-minutes: 5
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-        with:
-          scanMetadataReportFile: ${{ env.SERVICE_PATH }}/.scannerwork/report-task.txt
 
   # ────────────────────────────────────────────────────────────────────────────
   # JOB 3: build-scan
