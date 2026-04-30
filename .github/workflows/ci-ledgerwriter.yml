@@ -264,8 +264,13 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      - name: ACR login
-        run: az acr login --name $(echo "${{ secrets.ACR_LOGIN_SERVER }}" | cut -d. -f1)
+      - name: ACR login (token-based)
+        run: |
+          ACR_NAME=$(echo "${{ secrets.ACR_LOGIN_SERVER }}" | cut -d. -f1)
+          TOKEN=$(az acr login --name "$ACR_NAME" --expose-token --output tsv --query accessToken)
+          echo "$TOKEN" | docker login "${{ secrets.ACR_LOGIN_SERVER }}" \
+            --username 00000000-0000-0000-0000-000000000000 \
+            --password-stdin
 
       - name: Tag and push to ACR
         id: push
@@ -279,9 +284,7 @@ jobs:
           docker push ${FULL_IMAGE}:${SHORT_SHA}
           docker push ${FULL_IMAGE}:main
 
-          # Capture digest for Cosign signing (sign by digest, not tag)
-          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${FULL_IMAGE}:${SHORT_SHA} \
-            | cut -d@ -f2)
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${FULL_IMAGE}:${SHORT_SHA} | cut -d@ -f2)
           echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
           echo "full-image=${FULL_IMAGE}" >> "$GITHUB_OUTPUT"
 
