@@ -201,7 +201,7 @@ jobs:
         run: docker load < ${{ env.SERVICE_PATH }}/target/jib-image.tar
 
       - name: Trivy scan (CRITICAL only)
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ env.SERVICE_NAME }}:${{ needs.test.outputs.short-sha }}
           format: sarif
