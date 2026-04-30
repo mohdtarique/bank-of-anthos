@@ -1,0 +1,344 @@
+name: ci-ledgerwriter
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TRIGGERS
+# pull_request → validate on every PR (no push to ACR)
+# push/main    → full pipeline including image push + GitOps bump
+# paths filter → only trigger when ledgerwriter code changes
+# ──────────────────────────────────────────────────────────────────────────────
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/ledger/ledgerwriter/**'
+      - '.github/workflows/ci-ledgerwriter.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'src/ledger/ledgerwriter/**'
+      - '.github/workflows/ci-ledgerwriter.yml'
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PERMISSIONS
+# id-token:write     → OIDC token for Azure login (no stored credentials)
+# contents:read      → git checkout
+# security-events:write → upload Trivy SARIF to GitHub Advanced Security
+# pull-requests:write   → Sonar PR decoration comments
+# ──────────────────────────────────────────────────────────────────────────────
+permissions:
+  id-token: write
+  contents: read
+  security-events: write
+  pull-requests: write
+
+# ──────────────────────────────────────────────────────────────────────────────
+# WORKFLOW-LEVEL ENV
+# Defined once here — reused across all jobs
+# INBUILT VARS: github.sha (full 40-char SHA), github.ref, github.event_name
+# ──────────────────────────────────────────────────────────────────────────────
+env:
+  SERVICE_NAME: ledgerwriter
+  SERVICE_PATH: src/ledger/ledgerwriter
+  ACR_REPO: boa/ledgerwriter
+  JAVA_VERSION: '17'
+  JAVA_DISTRIBUTION: temurin
+
+jobs:
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 1: test
+  # Runs Maven unit tests + generates JaCoCo coverage report for Sonar
+  # Outputs: short-sha consumed by downstream jobs
+  #
+  # LEARNING: setup-java built-in Maven cache
+  # actions/setup-java has native .m2 cache support — no separate actions/cache
+  # needed for Maven. Set cache: 'maven' + cache-dependency-path: pom.xml
+  # Cache key = hash of pom.xml. If pom.xml unchanged → full .m2 cache restored
+  # in ~5s vs 60-90s cold download. This is how you cache JDK/MVN in enterprise.
+  # ────────────────────────────────────────────────────────────────────────────
+  test:
+    runs-on: ubuntu-latest
+    outputs:
+      short-sha: ${{ steps.vars.outputs.short-sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0    # full history for Sonar blame + PR decoration
+
+      - id: vars
+        name: Compute build variables
+        run: echo "short-sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Java ${{ env.JAVA_VERSION }} (Temurin) + Maven cache
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          cache: maven
+          cache-dependency-path: ${{ env.SERVICE_PATH }}/pom.xml
+
+      - name: Run unit tests + JaCoCo coverage
+        working-directory: ${{ env.SERVICE_PATH }}
+        run: |
+          mvn verify \
+            --batch-mode \
+            --no-transfer-progress \
+            -Djacoco.output=file \
+            -Dmaven.test.failure.ignore=false
+        # mvn verify = compile → test → package → verify (runs JaCoCo)
+        # --batch-mode: no color output (cleaner CI logs)
+        # --no-transfer-progress: suppresses download progress spam
+        # -Dmaven.test.failure.ignore=false: fail pipeline if tests fail
+
+      - name: Upload test results (Surefire XML)
+        if: always()    # upload even on test failure — needed for failure diagnosis
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-${{ env.SERVICE_NAME }}
+          path: ${{ env.SERVICE_PATH }}/target/surefire-reports/*.xml
+          retention-days: 7
+
+      - name: Upload JaCoCo coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: jacoco-${{ env.SERVICE_NAME }}
+          path: ${{ env.SERVICE_PATH }}/target/site/jacoco/jacoco.xml
+          retention-days: 1
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 2: sonar
+  # Runs after test job — needs coverage artifact from Job 1
+  # Quality gate blocks pipeline on failure
+  #
+  # LEARNING: needs + artifact download pattern
+  # needs: [test] → sonar only starts after test completes successfully
+  # download-artifact fetches jacoco.xml produced by test job
+  # This is the correct pattern for data transfer between jobs in GHA:
+  #   Job A → upload-artifact → Job B → download-artifact
+  # Do NOT use job outputs for large files (outputs are env vars, max ~1MB)
+  # Use outputs only for small strings: SHAs, version numbers, flags
+  # ────────────────────────────────────────────────────────────────────────────
+  sonar:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Java (required by Sonar scanner JVM)
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          cache: maven
+          cache-dependency-path: ${{ env.SERVICE_PATH }}/pom.xml
+
+      - name: Download JaCoCo coverage report
+        uses: actions/download-artifact@v4
+        with:
+          name: jacoco-${{ env.SERVICE_NAME }}
+          path: ${{ env.SERVICE_PATH }}/target/site/jacoco/
+
+      - name: SonarCloud scan
+        uses: SonarSource/sonarcloud-github-action@v3
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectBaseDir: ${{ env.SERVICE_PATH }}
+
+      - name: SonarCloud quality gate
+        uses: SonarSource/sonarqube-quality-gate-action@v1
+        timeout-minutes: 5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          scanMetadataReportFile: ${{ env.SERVICE_PATH }}/.scannerwork/report-task.txt
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 3: build-scan
+  # Builds container image using Jib (no Docker daemon)
+  # Runs Trivy on the image built by Jib
+  #
+  # LEARNING: Jib in CI — key difference from Dockerfile builds
+  # Jib builds directly from Maven → OCI image → pushes to registry
+  # No Docker daemon required. In CI: build to tarball → load for scanning
+  # Two-phase Jib approach:
+  #   Phase 1: build to local tarball (docker-daemon or tar output)
+  #   Phase 2: load + scan → if clean → push to ACR
+  # Why not `jib:build` directly? You can't scan before push.
+  # Correct pattern: `jib:buildTar` → load → trivy scan → push separately
+  # ────────────────────────────────────────────────────────────────────────────
+  build-scan:
+    runs-on: ubuntu-latest
+    needs: [test, sonar]
+    outputs:
+      image-tag: ${{ needs.test.outputs.short-sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Java + Maven cache
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          cache: maven
+          cache-dependency-path: ${{ env.SERVICE_PATH }}/pom.xml
+
+      - name: Build image tarball with Jib
+        working-directory: ${{ env.SERVICE_PATH }}
+        run: |
+          mvn compile jib:buildTar \
+            --batch-mode \
+            --no-transfer-progress \
+            -Djib.to.image=${{ env.SERVICE_NAME }}:${{ needs.test.outputs.short-sha }} \
+            -Djib.outputPaths.tar=target/jib-image.tar
+        # jib:buildTar = build OCI tarball locally (no push, no Docker daemon)
+        # Jib splits image into layers: deps / resources / classes
+        # Deps layer rarely changes = huge cache hit on subsequent builds
+
+      - name: Load Jib tarball into Docker for scanning
+        run: docker load < ${{ env.SERVICE_PATH }}/target/jib-image.tar
+
+      - name: Trivy scan (CRITICAL only)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.SERVICE_NAME }}:${{ needs.test.outputs.short-sha }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL
+          exit-code: '1'
+          ignore-unfixed: true
+
+      - name: Upload Trivy SARIF to GitHub Advanced Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-${{ env.SERVICE_NAME }}
+
+      - name: Upload Jib tarball for push job
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: jib-image-${{ env.SERVICE_NAME }}
+          path: ${{ env.SERVICE_PATH }}/target/jib-image.tar
+          retention-days: 1
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 4: sign-push
+  # Only runs on push to main — never on PR
+  # Downloads scanned tarball → re-tags → pushes to ACR → signs with Cosign
+  #
+  # LEARNING: OIDC auth to ACR — why no stored credentials
+  # Traditional: ACR admin password stored as GitHub secret (rotates manually,
+  #   leaked = full registry access)
+  # OIDC pattern:
+  #   1. GitHub mints OIDC token (signed JWT with repo/branch claims)
+  #   2. azure/login exchanges it for Azure AD access token via federated cred
+  #   3. az acr login uses Azure AD token → short-lived Docker token (1hr TTL)
+  #   4. docker push uses that token — nothing stored, nothing to leak
+  # Federated cred subject claim: repo:mohdtarique/bank-of-anthos:ref:refs/heads/main
+  # This exact string must match what Azure AD expects → only main branch can push
+  # ────────────────────────────────────────────────────────────────────────────
+  sign-push:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    needs: build-scan
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Jib image tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: jib-image-${{ env.SERVICE_NAME }}
+          path: /tmp/jib
+
+      - name: Load image from tarball
+        run: docker load < /tmp/jib/jib-image.tar
+
+      - name: Azure login (OIDC — no stored credentials)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: ACR login
+        run: az acr login --name $(echo "${{ secrets.ACR_LOGIN_SERVER }}" | cut -d. -f1)
+
+      - name: Tag and push to ACR
+        id: push
+        run: |
+          SHORT_SHA="${{ needs.build-scan.outputs.image-tag }}"
+          FULL_IMAGE="${{ secrets.ACR_LOGIN_SERVER }}/${{ env.ACR_REPO }}"
+
+          docker tag ${{ env.SERVICE_NAME }}:${SHORT_SHA} ${FULL_IMAGE}:${SHORT_SHA}
+          docker tag ${{ env.SERVICE_NAME }}:${SHORT_SHA} ${FULL_IMAGE}:main
+
+          docker push ${FULL_IMAGE}:${SHORT_SHA}
+          docker push ${FULL_IMAGE}:main
+
+          # Capture digest for Cosign signing (sign by digest, not tag)
+          DIGEST=$(docker inspect --format='{{index .RepoDigests 0}}' ${FULL_IMAGE}:${SHORT_SHA} \
+            | cut -d@ -f2)
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "full-image=${FULL_IMAGE}" >> "$GITHUB_OUTPUT"
+
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Cosign sign (keyless OIDC)
+        env:
+          COSIGN_EXPERIMENTAL: '1'
+        run: |
+          cosign sign --yes \
+            ${{ steps.push.outputs.full-image }}@${{ steps.push.outputs.digest }}
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 5: gitops-bump
+  # Updates boa-gitops values.yaml with new image tag
+  # ArgoCD detects the change and rolls out the new image
+  #
+  # LEARNING: cross-repo write pattern
+  # Cannot use OIDC for cross-repo git push (OIDC is for Azure, not GitHub API)
+  # Must use a PAT (BOA_GITOPS_TOKEN) scoped to boa-gitops repo only:
+  #   - Fine-grained PAT: Contents: read+write on boa-gitops only
+  #   - No access to bank-of-anthos or any other repo
+  # This is the correct least-privilege pattern for GitOps bumps
+  # ────────────────────────────────────────────────────────────────────────────
+  gitops-bump:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    needs: [build-scan, sign-push]
+    steps:
+      - name: Checkout boa-gitops
+        uses: actions/checkout@v4
+        with:
+          repository: mohdtarique/boa-gitops
+          token: ${{ secrets.BOA_GITOPS_TOKEN }}
+          ref: main
+
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq \
+            https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Update ledgerwriter image tag
+        run: |
+          yq eval -i \
+            '.ledgerwriter.image.tag = "${{ needs.build-scan.outputs.image-tag }}"' \
+            helm/boa-ledger/values.yaml
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add helm/boa-ledger/values.yaml
+          git diff --cached --quiet && exit 0
+          git commit -m "chore(ledgerwriter): bump image tag to ${{ needs.build-scan.outputs.image-tag }}
+
+          Source: ${{ github.repository }}@${{ github.sha }}
+          Workflow: ${{ github.workflow }} (run #${{ github.run_number }})"
+          git push origin main
